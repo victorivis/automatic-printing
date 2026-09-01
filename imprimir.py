@@ -25,11 +25,13 @@ Observações importantes:
   necessário integrar com nenhum software específico da HP.
 """
 
+import os
+import subprocess
 import sys
 
 import markdown
 import pyperclip
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from PyQt6.QtGui import QTextDocument, QIcon, QAction
 from PyQt6.QtWidgets import (
     QApplication,
@@ -53,7 +55,16 @@ except ImportError:
 
 HOTKEY = "ctrl+alt+p"
 
-# CSS simples para a conversa ficar legível tanto na tela quanto impressa
+WINDOW_READY_DELAY_MS = 250
+WIDTH = 700
+HEIGHT = 600
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+    
+CLICAR_MELHORADO_PATH = os.path.join(SCRIPT_DIR, "clicar_melhorado.py")
+
 PRINT_CSS = """
 <style>
     body { font-family: Segoe UI, Arial, sans-serif; font-size: 12pt; line-height: 1.4; }
@@ -78,11 +89,13 @@ def markdown_to_html(text: str) -> str:
 
 class PreviewDialog(QDialog):
     """Janela de preview: mostra o Markdown já formatado antes de imprimir."""
+    
+    window_ready = pyqtSignal()
 
     def __init__(self, html: str):
         super().__init__()
         self.setWindowTitle("Preview de impressão — Clipboard to Print")
-        self.resize(700, 800)
+        self.resize(WIDTH, HEIGHT)
 
         layout = QVBoxLayout(self)
 
@@ -103,6 +116,15 @@ class PreviewDialog(QDialog):
         button_row.addWidget(cancel_btn)
         button_row.addWidget(print_btn)
         layout.addLayout(button_row)
+
+        self._ready_signal_sent = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        
+        if not self._ready_signal_sent:
+            self._ready_signal_sent = True
+            QTimer.singleShot(WINDOW_READY_DELAY_MS, self.window_ready.emit)
 
     def handle_print(self):
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
@@ -151,6 +173,10 @@ class ClipboardToPrintApp:
         self.tray.setContextMenu(menu)
         self.tray.show()
 
+        # Guarda referência ao processo lançado, para não ser coletado
+        # pelo garbage collector enquanto ainda está rodando.
+        self._clicar_process = None
+
         if HAS_GLOBAL_HOTKEY:
             # Importante: o callback do keyboard roda em outra thread,
             # então ele só pode emitir o sinal — nunca chamar
@@ -176,9 +202,58 @@ class ClipboardToPrintApp:
         html = markdown_to_html(text)
         # Guarda referência para o dialog não ser coletado pelo garbage collector
         self.dialog = PreviewDialog(html)
+        self.dialog.window_ready.connect(self.run_clicar_melhorado)
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
+
+    def run_clicar_melhorado(self):
+        """
+        Dispara a automação de clique depois que o preview já abriu.
+
+        Antes isso era feito com `import clicar_melhorado` seguido de
+        `clicar_melhorado.rotina_clicar()` na própria thread principal
+        — como essa thread é a mesma que desenha e responde a eventos
+        da interface Qt, a janela de preview ficava "congelada"
+        (sem redraw, sem resposta a cliques) enquanto a rotina de
+        clique estivesse executando.
+
+        Agora, `clicar_melhorado.py` roda como um PROCESSO separado via
+        subprocess.Popen(). Isso:
+          - não bloqueia o event loop do Qt (a chamada Popen() retorna
+            na hora, o processo continua rodando em paralelo);
+          - isola falhas: se `clicar_melhorado.py` travar ou crashar,
+            isso não derruba o app principal;
+          - tem a contrapartida de que trocar dados diretamente entre
+            os dois processos (variáveis Python compartilhadas) não é
+            mais possível — se precisar disso no futuro, dá pra usar
+            argumentos de linha de comando, um arquivo temporário, ou
+            stdin/stdout.
+        """
+        if not os.path.isfile(CLICAR_MELHORADO_PATH):
+            self.tray.showMessage(
+                "Clipboard to Print",
+                f"Não encontrei clicar_melhorado.py em: {CLICAR_MELHORADO_PATH}",
+                QSystemTrayIcon.MessageIcon.Warning,
+            )
+            return
+
+        try:
+            # sys.executable garante que usamos o mesmo interpretador
+            # Python (e o mesmo venv, se houver) que está rodando este
+            # script, evitando confusão com outra versão de Python
+            # instalada no sistema.
+            self._clicar_process = subprocess.Popen(
+                [sys.executable, CLICAR_MELHORADO_PATH],
+                cwd=SCRIPT_DIR,
+            )
+        except OSError as e:
+            # Ex: permissão negada, interpretador não encontrado, etc.
+            self.tray.showMessage(
+                "Clipboard to Print",
+                f"Erro ao iniciar clicar_melhorado.py: {e}",
+                QSystemTrayIcon.MessageIcon.Critical,
+            )
 
     def run(self):
         sys.exit(self.app.exec())
