@@ -9,10 +9,10 @@ pyautogui.FAILSAFE = True
 
 INIT_TIME = 5
 ACTION_PAUSE = 3
-CLICK_PAUSE = 0.3
-MOUSE_MOVE_TIME = 0.35
+CLICK_PAUSE = 0.4
+MOUSE_MOVE_TIME = 0.25
 CONFIDENCE = 0.8
-DEBUG = False
+DEBUG = True
 
 # ==================== DEFINIÇÃO DAS AÇÕES ====================
 # Cada ação pode ser:
@@ -33,7 +33,7 @@ DEBUG = False
 
 acoes = [
     "0-abrir_ui",
-    "1-comecar",
+    {"nome": "1-comecar", "clicks": 2},
     {"nome": "2-impressora", "offset_y": -5},
     "3-seleciona_hp",
     {"nome": "4-imprimir", "clicks": 2}
