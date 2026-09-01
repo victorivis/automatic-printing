@@ -33,7 +33,7 @@ import sys
 
 import markdown
 import pyperclip
-from PyQt6.QtCore import QObject, pyqtSignal, QTimer
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QSizeF
 from PyQt6.QtGui import QTextDocument, QIcon, QAction
 from PyQt6.QtWidgets import (
     QApplication,
@@ -68,6 +68,19 @@ HEIGHT = 600
 # do código.
 DEFAULT_PRINTER_NAME = "HPE62BEC (HP Smart Tank 580-590 series)"
 
+# Impressão frente e verso manual: depois de virar a pilha de papel já
+# impressa e recolocar na bandeja, a ordem física em que as folhas vão
+# ser alimentadas de volta depende do modelo/bandeja da impressora —
+# não tem como o software adivinhar isso com certeza. O padrão mais
+# comum (pilha sai com a última página impressa por cima; ao virar a
+# pilha inteira como um bloco e recolocar, a impressora volta a
+# alimentar a partir do que antes estava embaixo) é imprimir as
+# páginas pares em ordem DECRESCENTE na segunda passada. Se, ao testar
+# com um documento curto (4 páginas, por exemplo), os versos saírem
+# fora de ordem ou de cabeça para baixo, troque este valor para False
+# e teste de novo.
+EVEN_PAGES_REVERSED = True
+
 
 def find_installed_printer_name(preferred: str) -> str | None:
     """
@@ -96,6 +109,38 @@ def find_installed_printer_name(preferred: str) -> str | None:
             return name
 
     return None
+
+
+def compute_total_pages(document: QTextDocument, printer: QPrinter) -> int:
+    """
+    Descobre quantas páginas o documento vai ocupar ao ser impresso
+    nesta impressora — precisamos saber isso de antemão para montar as
+    listas de páginas ímpares/pares. Isso ajusta o tamanho de página
+    do documento para bater com a área imprimível da impressora (é o
+    que document.print(printer) faz por baixo dos panos automaticamente
+    numa impressão normal).
+    """
+    page_size = QSizeF(printer.pageRect(QPrinter.Unit.DevicePixel).size())
+    document.setPageSize(page_size)
+    return document.pageCount()
+
+
+def print_pages(document: QTextDocument, printer: QPrinter, page_numbers: list) -> None:
+    """
+    Imprime apenas as páginas (numeração começando em 1) presentes em
+    `page_numbers`, na ordem em que aparecem na lista.
+
+    QTextDocument.print() sempre imprime o documento inteiro de uma
+    vez; para selecionar só algumas páginas usamos o mesmo mecanismo
+    do diálogo de impressão do Windows (printRange + fromPage/toPage),
+    chamando print() uma vez por página. Cada chamada gera um "job" de
+    impressão próprio, mas fisicamente as folhas saem uma atrás da
+    outra, na ordem em que foram enviadas.
+    """
+    printer.setPrintRange(QPrinter.PrintRange.PageRange)
+    for page_num in page_numbers:
+        printer.setFromTo(page_num, page_num)
+        document.print(printer)
 
 def get_base_dir() -> str:
     """
@@ -180,12 +225,15 @@ class PreviewDialog(QDialog):
         button_row = QHBoxLayout()
         outra_impressora_btn = QPushButton("Escolher impressora...")
         outra_impressora_btn.clicked.connect(self.handle_print_with_dialog)
+        duplex_btn = QPushButton("Imprimir frente e verso")
+        duplex_btn.clicked.connect(self.handle_print_duplex)
         print_btn = QPushButton("Imprimir na HP")
         print_btn.clicked.connect(self.handle_print_auto)
         cancel_btn = QPushButton("Cancelar")
         cancel_btn.clicked.connect(self.close)
         button_row.addStretch()
         button_row.addWidget(outra_impressora_btn)
+        button_row.addWidget(duplex_btn)
         button_row.addWidget(cancel_btn)
         button_row.addWidget(print_btn)
         layout.addLayout(button_row)
@@ -233,6 +281,62 @@ class PreviewDialog(QDialog):
         dialog = QPrintDialog(printer, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.text_edit.document().print(printer)
+        self.close()
+
+    def handle_print_duplex(self):
+        """
+        Impressão frente e verso manual: a HP Smart Tank 580-590 não
+        tem duplex automático. Imprime primeiro as páginas ímpares,
+        pede pra virar a pilha de papel e recolocar na bandeja, e só
+        então imprime as páginas pares.
+        """
+        printer_name = find_installed_printer_name(DEFAULT_PRINTER_NAME)
+        if printer_name is None:
+            QMessageBox.warning(
+                self,
+                "Impressora não encontrada",
+                f"Não encontrei nenhuma impressora instalada parecida com "
+                f"\"{DEFAULT_PRINTER_NAME}\".\n\n"
+                "Impressão frente e verso cancelada.",
+            )
+            return
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setPrinterName(printer_name)
+
+        document = self.text_edit.document()
+        total_pages = compute_total_pages(document, printer)
+
+        odd_pages = list(range(1, total_pages + 1, 2))
+        even_pages = list(range(2, total_pages + 1, 2))
+
+        if not even_pages:
+            # Documento com 1 página só — não tem verso pra imprimir.
+            print_pages(document, printer, odd_pages)
+            self.close()
+            return
+
+        if EVEN_PAGES_REVERSED:
+            even_pages = list(reversed(even_pages))
+
+        print_pages(document, printer, odd_pages)
+
+        resposta = QMessageBox.question(
+            self,
+            "Vire as páginas",
+            f"As {len(odd_pages)} página(s) de frente foram enviadas "
+            "para a impressora.\n\n"
+            "Pegue a pilha impressa na bandeja de saída, vire-a inteira "
+            "(sem embaralhar a ordem das folhas) e recoloque na "
+            "bandeja de entrada.\n\n"
+            "Quando estiver pronto, clique em \"OK\" para imprimir o verso.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Ok,
+        )
+
+        if resposta == QMessageBox.StandardButton.Ok:
+            print_pages(document, printer, even_pages)
+
         self.close()
 
 
