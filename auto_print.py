@@ -9,8 +9,14 @@ com o Markdown já formatado em HTML aparece. Você revisa e clica em
 (sem abrir nenhum diálogo do Windows), ou em "Escolher impressora..."
 para usar o diálogo de impressão normal do Windows e escolher outra.
 
+Também dá pra imprimir um PDF: pelo menu da bandeja, "Imprimir PDF
+selecionado no Explorer" pega o arquivo .pdf selecionado na janela do
+Explorer em primeiro plano, ou "Escolher PDF para imprimir..." abre um
+seletor de arquivos. Os dois abrem a mesma janela de confirmação, com
+as mesmas opções de impressão simples ou frente e verso.
+
 Instalação:
-    pip install PyQt6 pyperclip keyboard markdown
+    pip install PyQt6 pyperclip keyboard markdown pywin32
 
 Execução:
     python clipboard_to_print.py
@@ -25,6 +31,10 @@ Observações importantes:
   selecionando a impressora pelo nome (DEFAULT_PRINTER_NAME) — não
   depende de simular cliques na tela, então funciona igual rodando
   interativamente ou via Agendador de Tarefas.
+- "Imprimir PDF selecionado no Explorer" depende de "pywin32"
+  (win32com/win32gui) para conversar com o Explorer via COM. Sem essa
+  lib instalada, essa opção específica simplesmente não funciona —
+  "Escolher PDF para imprimir..." continua funcionando normalmente.
 """
 
 import os
@@ -33,8 +43,8 @@ import sys
 
 import markdown
 import pyperclip
-from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QSizeF
-from PyQt6.QtGui import QTextDocument, QIcon, QAction
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QSizeF, QSize, QPointF, Qt
+from PyQt6.QtGui import QTextDocument, QIcon, QAction, QPainter
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -47,8 +57,10 @@ from PyQt6.QtWidgets import (
     QMenu,
     QStyle,
     QMessageBox,
+    QFileDialog,
 )
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter, QPrinterInfo
+from PyQt6.QtPdf import QPdfDocument
 
 try:
     import keyboard  # atalho global (fora da janela do app)
@@ -141,6 +153,84 @@ def print_pages(document: QTextDocument, printer: QPrinter, page_numbers: list) 
     for page_num in page_numbers:
         printer.setFromTo(page_num, page_num)
         document.print(printer)
+
+
+def print_pdf_pages(pdf_doc: QPdfDocument, printer: QPrinter, page_numbers: list) -> None:
+    """
+    Renderiza e imprime as páginas de um PDF (numeração começando em
+    1) presentes em `page_numbers`, na ordem dada, dentro de um único
+    job de impressão (usando printer.newPage() entre uma página e
+    outra).
+
+    Ao contrário de QTextDocument, QPdfDocument não tem um método
+    print() pronto — cada página é renderizada como imagem (na
+    resolução da impressora, pra não perder qualidade) e desenhada
+    centralizada na área imprimível.
+    """
+    painter = QPainter(printer)
+    try:
+        target_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
+        dpi = printer.resolution()
+
+        for i, page_num in enumerate(page_numbers):
+            if i > 0:
+                printer.newPage()
+
+            page_index = page_num - 1
+            page_points = pdf_doc.pagePointSize(page_index)  # tamanho em pontos (1/72")
+            render_size = QSize(
+                round(page_points.width() / 72.0 * dpi),
+                round(page_points.height() / 72.0 * dpi),
+            )
+            image = pdf_doc.render(page_index, render_size)
+
+            scaled = image.scaled(
+                target_rect.size().toSize(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = target_rect.x() + (target_rect.width() - scaled.width()) / 2
+            y = target_rect.y() + (target_rect.height() - scaled.height()) / 2
+            painter.drawImage(QPointF(x, y), scaled)
+    finally:
+        painter.end()
+
+
+def get_selected_pdf_from_explorer():
+    """
+    Tenta descobrir o caminho de um arquivo .pdf atualmente selecionado
+    na janela do Windows Explorer que estiver em primeiro plano.
+
+    Usa automação COM ("Shell.Application") para listar as janelas do
+    Explorer abertas, casa a que está em primeiro plano pelo HWND, e lê
+    os itens selecionados nela. Retorna None se: pywin32 não estiver
+    instalado, não houver Explorer em primeiro plano, nada estiver
+    selecionado, ou o item selecionado não for um .pdf.
+    """
+    try:
+        import win32com.client
+        import win32gui
+    except ImportError:
+        return None
+
+    try:
+        foreground_hwnd = win32gui.GetForegroundWindow()
+        shell = win32com.client.Dispatch("Shell.Application")
+
+        for window in shell.Windows():
+            try:
+                if window.HWND != foreground_hwnd:
+                    continue
+                for item in window.Document.SelectedItems():
+                    path = item.Path
+                    if path and path.lower().endswith(".pdf"):
+                        return path
+            except Exception:
+                continue
+    except Exception:
+        return None
+
+    return None
 
 def get_base_dir() -> str:
     """
@@ -340,7 +430,143 @@ class PreviewDialog(QDialog):
         self.close()
 
 
-class HotkeyBridge(QObject):
+class PdfPrintDialog(QDialog):
+    """
+    Janela de confirmação para imprimir um arquivo PDF (selecionado no
+    Explorer ou escolhido manualmente) — mesmas opções de impressão da
+    PreviewDialog (impressora padrão, escolher outra, frente e verso),
+    mas operando sobre um QPdfDocument em vez de um QTextDocument com
+    HTML do clipboard.
+    """
+
+    def __init__(self, pdf_path: str):
+        super().__init__()
+        self.pdf_path = pdf_path
+        self.setWindowTitle("Imprimir PDF — Clipboard to Print")
+        self.resize(420, 180)
+
+        self.pdf_doc = QPdfDocument(None)
+        self.pdf_doc.load(pdf_path)
+
+        layout = QVBoxLayout(self)
+
+        nome_arquivo = os.path.basename(pdf_path)
+        if self.pdf_doc.status() == QPdfDocument.Status.Ready:
+            total_pages = self.pdf_doc.pageCount()
+            info_text = f"Arquivo: {nome_arquivo}\nPáginas: {total_pages}"
+        else:
+            total_pages = 0
+            info_text = (
+                f"Arquivo: {nome_arquivo}\n"
+                "⚠️ Não consegui abrir este PDF (arquivo corrompido, "
+                "protegido por senha, ou caminho inválido)."
+            )
+        self._total_pages = total_pages
+
+        info = QLabel(info_text)
+        layout.addWidget(info)
+
+        abrir_btn = QPushButton("Abrir PDF para conferir")
+        abrir_btn.clicked.connect(self.abrir_pdf_externamente)
+        layout.addWidget(abrir_btn)
+
+        button_row = QHBoxLayout()
+        outra_impressora_btn = QPushButton("Escolher impressora...")
+        outra_impressora_btn.clicked.connect(self.handle_print_with_dialog)
+        duplex_btn = QPushButton("Imprimir frente e verso")
+        duplex_btn.clicked.connect(self.handle_print_duplex)
+        print_btn = QPushButton("Imprimir na HP (um lado)")
+        print_btn.clicked.connect(self.handle_print_auto)
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.clicked.connect(self.close)
+        button_row.addStretch()
+        button_row.addWidget(outra_impressora_btn)
+        button_row.addWidget(duplex_btn)
+        button_row.addWidget(cancel_btn)
+        button_row.addWidget(print_btn)
+        layout.addLayout(button_row)
+
+        if total_pages == 0:
+            outra_impressora_btn.setEnabled(False)
+            duplex_btn.setEnabled(False)
+            print_btn.setEnabled(False)
+
+    def abrir_pdf_externamente(self):
+        try:
+            os.startfile(self.pdf_path)
+        except Exception as e:
+            QMessageBox.warning(self, "Erro ao abrir PDF", str(e))
+
+    def handle_print_auto(self):
+        printer_name = find_installed_printer_name(DEFAULT_PRINTER_NAME)
+        if printer_name is None:
+            QMessageBox.warning(
+                self,
+                "Impressora não encontrada",
+                f"Não encontrei nenhuma impressora instalada parecida com "
+                f"\"{DEFAULT_PRINTER_NAME}\".\n\n"
+                "Escolha manualmente na próxima janela.",
+            )
+            self.handle_print_with_dialog()
+            return
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setPrinterName(printer_name)
+        print_pdf_pages(self.pdf_doc, printer, list(range(1, self._total_pages + 1)))
+        self.close()
+
+    def handle_print_with_dialog(self):
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dialog = QPrintDialog(printer, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            print_pdf_pages(self.pdf_doc, printer, list(range(1, self._total_pages + 1)))
+        self.close()
+
+    def handle_print_duplex(self):
+        printer_name = find_installed_printer_name(DEFAULT_PRINTER_NAME)
+        if printer_name is None:
+            QMessageBox.warning(
+                self,
+                "Impressora não encontrada",
+                f"Não encontrei nenhuma impressora instalada parecida com "
+                f"\"{DEFAULT_PRINTER_NAME}\".\n\n"
+                "Impressão frente e verso cancelada.",
+            )
+            return
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setPrinterName(printer_name)
+
+        odd_pages = list(range(1, self._total_pages + 1, 2))
+        even_pages = list(range(2, self._total_pages + 1, 2))
+
+        if not even_pages:
+            print_pdf_pages(self.pdf_doc, printer, odd_pages)
+            self.close()
+            return
+
+        if EVEN_PAGES_REVERSED:
+            even_pages = list(reversed(even_pages))
+
+        print_pdf_pages(self.pdf_doc, printer, odd_pages)
+
+        resposta = QMessageBox.question(
+            self,
+            "Vire as páginas",
+            f"As {len(odd_pages)} página(s) de frente foram enviadas "
+            "para a impressora.\n\n"
+            "Pegue a pilha impressa na bandeja de saída, vire-a inteira "
+            "(sem embaralhar a ordem das folhas) e recoloque na "
+            "bandeja de entrada.\n\n"
+            "Quando estiver pronto, clique em \"OK\" para imprimir o verso.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Ok,
+        )
+
+        if resposta == QMessageBox.StandardButton.Ok:
+            print_pdf_pages(self.pdf_doc, printer, even_pages)
+
+        self.close()
     """
     A lib 'keyboard' dispara o callback do atalho numa thread separada
     (a thread de captura de teclado do sistema). O Qt não permite criar
@@ -372,6 +598,14 @@ class ClipboardToPrintApp:
         print_action.triggered.connect(self.trigger_from_clipboard)
         menu.addAction(print_action)
 
+        pdf_explorer_action = QAction("Imprimir PDF selecionado no Explorer")
+        pdf_explorer_action.triggered.connect(self.trigger_pdf_from_explorer)
+        menu.addAction(pdf_explorer_action)
+
+        pdf_browse_action = QAction("Escolher PDF para imprimir...")
+        pdf_browse_action.triggered.connect(self.trigger_pdf_from_dialog)
+        menu.addAction(pdf_browse_action)
+
         quit_action = QAction("Sair")
         quit_action.triggered.connect(self.app.quit)
         menu.addAction(quit_action)
@@ -394,6 +628,36 @@ class ClipboardToPrintApp:
                 "Biblioteca 'keyboard' não encontrada — use o menu da bandeja para imprimir.",
                 QSystemTrayIcon.MessageIcon.Warning,
             )
+
+    def trigger_pdf_from_explorer(self):
+        """Pega o .pdf selecionado na janela do Explorer em primeiro plano e abre a janela de impressão."""
+        pdf_path = get_selected_pdf_from_explorer()
+        if not pdf_path:
+            self.tray.showMessage(
+                "Clipboard to Print",
+                "Não consegui identificar um PDF selecionado no Explorer. "
+                "Selecione um arquivo .pdf numa janela do Explorer e tente de "
+                "novo, ou use \"Escolher PDF para imprimir...\".",
+                QSystemTrayIcon.MessageIcon.Information,
+            )
+            return
+        self.open_pdf_print_dialog(pdf_path)
+
+    def trigger_pdf_from_dialog(self):
+        """Abre um seletor de arquivos para escolher qual PDF imprimir."""
+        pdf_path, _ = QFileDialog.getOpenFileName(
+            None, "Escolher PDF para imprimir", "", "Arquivos PDF (*.pdf)"
+        )
+        if not pdf_path:
+            return  # usuário cancelou o seletor
+        self.open_pdf_print_dialog(pdf_path)
+
+    def open_pdf_print_dialog(self, pdf_path: str):
+        # Guarda referência para o dialog não ser coletado pelo garbage collector
+        self.pdf_dialog = PdfPrintDialog(pdf_path)
+        self.pdf_dialog.show()
+        self.pdf_dialog.raise_()
+        self.pdf_dialog.activateWindow()
 
     def trigger_from_clipboard(self):
         text = pyperclip.paste()
